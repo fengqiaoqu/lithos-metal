@@ -30,7 +30,7 @@ from ..formats.fp import f32_to_bf16
 NOISE_MARGIN = 0.03           # a variant replaces the default only if faster by more than this fraction
 
 
-def gemv_key(info: PackInfo, t: int, epilogue: Optional[str], norm_fed: bool, stat_parts: int = 64) -> str:
+def gemv_key(info: PackInfo, t: int, epilogue: Optional[str], norm_fed: bool, stat_parts: int = 64, stat_out: bool = False) -> str:
     key = f"gemv|{info.format}|{info.n}x{info.k}|R{info.rows}|{info.lane_order}|{info.scale_placement}|T{t}|{epilogue or 'plain'}|{'norm' if norm_fed else 'raw'}"
     if info.scale_lane_divisor != 1:
         key += f"|shared-scales{info.scale_lane_divisor}"
@@ -38,6 +38,8 @@ def gemv_key(info: PackInfo, t: int, epilogue: Optional[str], norm_fed: bool, st
         key += f"|scale-order-{info.scale_order}"
     if norm_fed and stat_parts != 64:
         key += f"|P{stat_parts}"                                     # the producer's partial count: the fused norm folds it per SIMD-group
+    if stat_out:
+        key += "|stat"                                               # the op writes the next norm's statistic: timed writing it
     return key
 
 
@@ -73,15 +75,18 @@ class Choice:
 class KernelChoices:
     """A chip configuration's measured choices (``kernel_choices``: entries of this tuner's cache written on that chip)
     looked up by the same keys, without timing anything: a shape they do not list compiles with the defaults, as
-    without a tuner (``None``)."""
+    without a tuner (``None``). A statistic producer takes its own entry (``|stat``) where the table has one, else the
+    shape's."""
 
     measured = True                      # nothing to time: the prompt passes take their tiles' choices too
 
     def __init__(self, choices: Dict[str, Dict[str, Any]]) -> None:
         self.choices = dict(choices)
 
-    def tune_gemv(self, info: PackInfo, t: int, epilogue: Optional[str], norm_fed: bool, *, stat_parts: int = 64, **_: Any) -> Optional[Choice]:
-        c = self.choices.get(gemv_key(info, t, epilogue, norm_fed, stat_parts))
+    def tune_gemv(self, info: PackInfo, t: int, epilogue: Optional[str], norm_fed: bool, *, stat_parts: int = 64, stat_out: bool = False,
+                  **_: Any) -> Optional[Choice]:
+        c = ((stat_out and self.choices.get(gemv_key(info, t, epilogue, norm_fed, stat_parts, stat_out=True)))
+             or self.choices.get(gemv_key(info, t, epilogue, norm_fed, stat_parts)))
         return c and Choice(dict(c["macros"]), c["grid_mode"], c.get("fuse_norm", False), c.get("ms", 0.0), c.get("default_ms", 0.0))
 
     def tune_gemm(self, info: PackInfo, tm: int, epilogue: Optional[str], *, permute: bool = False, norm_fed: bool = False,
@@ -124,8 +129,11 @@ class Autotuner:
             best = r.gpu_ms if best is None else min(best, r.gpu_ms)
         return best
 
-    def grid(self, mode: str, n_blocks: int) -> Tuple[int, int, int]:
-        """(n_sg, grid threadgroups, threadgroup size) for a geometry mode."""
+    def grid(self, mode: str, n_blocks: int, rsplit: int = 1) -> Tuple[int, int, int]:
+        """(n_sg, grid threadgroups, threadgroup size) for a geometry mode (``tgsplit``: a block per threadgroup of
+        ``rsplit`` SIMD-groups)."""
+        if mode == "tgsplit":
+            return n_blocks * rsplit, n_blocks, 32 * rsplit
         if mode == "block":
             n_sg = n_blocks
             return n_sg, -(-(n_sg * 32) // 64), 64
@@ -133,10 +141,13 @@ class Autotuner:
         return n_sg, -(-(n_sg * 32) // 384), 384
 
     # ---- GEMV ----------------------------------------------------------------------------------------------------
-    def tune_gemv(self, info: PackInfo, t: int, epilogue: Optional[str], norm_fed: bool, *, force: bool = False, stat_parts: int = 64) -> Choice:
+    def tune_gemv(self, info: PackInfo, t: int, epilogue: Optional[str], norm_fed: bool, *, force: bool = False, stat_parts: int = 64,
+                  stat_out: bool = False) -> Choice:
         """``stat_parts``: the partial sums per token the norm statistic arrives in (the producer's blocks × its row
-        split) — the fused variant folds them in every SIMD-group, so the benchmark must see the program's count."""
-        key = gemv_key(info, t, epilogue, norm_fed, stat_parts)
+        split) — the fused variant folds them in every SIMD-group, so the benchmark must see the program's count.
+        ``stat_out``: the op writes the next norm's statistic (STAT_OUT) — every variant is timed writing it, only then
+        is the in-threadgroup row split (``tgsplit``) a candidate, and the choice has its own cache entry."""
+        key = gemv_key(info, t, epilogue, norm_fed, stat_parts, stat_out)
         if key in self.choices and not force:
             c = self.choices[key]
             return Choice(dict(c["macros"]), c["grid_mode"], c.get("fuse_norm", False), c.get("ms", 0.0), c.get("default_ms", 0.0))
@@ -159,6 +170,7 @@ class Autotuner:
         nw = nt.Buffer(self.dev, np.ones(info.k, np.float32).tobytes())
         res = nt.Buffer(self.dev, t * info.n * 2)
         xn = nt.Buffer(self.dev, t * info.k * 2)
+        sout = nt.Buffer(self.dev, t * 4 * pinfo.n_blocks * 16) if stat_out else None     # a partial per item: blocks × RSPLIT ≤ 16
         variants: List[Tuple[str, Dict[str, Any]]] = []
         rgs = [r for r in ((1, 2, 4, 8) if t == 1 else (2, 4, 8)) if r <= info.rows and info.rows % r == 0]   # RG 1: one-row items (RSPLIT 16), for the small-K slabs whose activation is hoisted
         for rg, mode in itertools.product(rgs, ("crew", "crew2", "crew3", "crew4", "block")):
@@ -169,14 +181,24 @@ class Autotuner:
                 variants.append(("apply", {"rg": rg, "mode": mode, "fuse": False, "rsplit": rs}))
                 if norm_fed:
                     variants.append(("fused", {"rg": rg, "mode": mode, "fuse": True, "rsplit": rs}))
+        if stat_out and epilogue != "silu_mul":
+            # a statistic producer's row split inside one threadgroup (STAT_TG): its partials stay the unsplit op's
+            # (gemv_T takes STAT_TG without silu_mul's paired rows)
+            for rg in rgs:
+                for rs in kernels.gemv_rsplits(info.rows, rg, epilogue):
+                    if rs > 1:
+                        variants.append(("apply", {"rg": rg, "mode": "tgsplit", "fuse": False, "rsplit": rs}))
         results = []
         default_ms = None
         for _, v in variants:
             try:
-                macros = kernels.gemv_macros(pinfo, t=t, rg=v["rg"], epilogue=epilogue, norm=v["fuse"], out_bf16=True, rsplit=v["rsplit"])
+                macros = kernels.gemv_macros(pinfo, t=t, rg=v["rg"], epilogue=epilogue, norm=v["fuse"], out_bf16=True, rsplit=v["rsplit"],
+                                             stat_out=stat_out)
+                if v["mode"] == "tgsplit":
+                    macros["STAT_TG"] = "1"
             except ValueError:
                 continue
-            n_sg, grid, tg = self.grid(v["mode"], pinfo.n_blocks)
+            n_sg, grid, tg = self.grid(v["mode"], pinfo.n_blocks, v["rsplit"])
             pso = nt.Pipeline(nt.Library(self.dev, kernels.gemv_source(info.format), macros), "gemv_T")
             prm = kernels.gemv_params(info.n, pinfo.n_blocks, n_sg, t, eps=1e-6, stat_parts=parts)
             ds = []
@@ -192,6 +214,8 @@ class Autotuner:
                     d.buffer(5, stat).buffer(6, nw)
                 if epilogue == "residual":
                     d.buffer(7, res)
+                if stat_out:
+                    d.buffer(8, sout)
                 ds.append(d)
             ms = self._time(ds) / copies
             is_default = (v["rg"] == int(kernels.gemv_macros(pinfo, t=t, epilogue=epilogue, out_bf16=True)["RG"]) and v["mode"] == "crew"

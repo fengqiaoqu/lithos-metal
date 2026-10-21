@@ -142,8 +142,11 @@ class _Ctx:
     def crew_grid(self) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
         return (-(-(self.n_sg * 32) // self.tg), 1, 1), (self.tg, 1, 1)
 
-    def geometry(self, mode: str, n_blocks: int) -> Tuple[int, Tuple[int, int, int], Tuple[int, int, int]]:
-        """(n_sg, grid, threadgroup) for an autotuned geometry mode."""
+    def geometry(self, mode: str, n_blocks: int, rsplit: int = 1) -> Tuple[int, Tuple[int, int, int], Tuple[int, int, int]]:
+        """(n_sg, grid, threadgroup) for an autotuned geometry mode (``tgsplit``: a block's ``rsplit`` items are the
+        SIMD-groups of one threadgroup)."""
+        if mode == "tgsplit":
+            return n_blocks * rsplit, (n_blocks, 1, 1), (32 * rsplit, 1, 1)
         if mode == "block":
             return n_blocks, (-(-(n_blocks * 32) // 64), 1, 1), (64, 1, 1)
         if mode.startswith("ksplit"):                                    # the tile's K-split: one tile per threadgroup of S SIMD-groups
@@ -348,7 +351,9 @@ def _gemv(ctx: _Ctx, op: Op) -> None:
         _gemm_tile(ctx, op, info, tile_range, t_src, block0, n_blocks, n_rows, nbytes, vgroup)   # a static row count: the tile alone
         return
     parts_in = ctx.stat_parts.get(stat.name, 1) if stat is not None else 1        # the statistic's partials the fused norm folds
-    choices = [ctx.tuner.tune_gemv(info, tv, epilogue, stat is not None, stat_parts=parts_in) if ctx.tuner is not None else None for tv in variants]
+    stat_out = op.attrs.get("stat_value")
+    choices = [ctx.tuner.tune_gemv(info, tv, epilogue, stat is not None, stat_parts=parts_in, stat_out=stat_out is not None)
+               if ctx.tuner is not None else None for tv in variants]
     fuse_norm = bool(choices[0]) and all(c is not None and c.fuse_norm for c in choices)
     eps = float(op.attrs.get("eps", 1e-6))
     x_binding = ctx.buf(x)
@@ -360,12 +365,18 @@ def _gemv(ctx: _Ctx, op: Op) -> None:
             _norm_apply(ctx, x, stat, nw, eps, (xn, 0), t_c, t_src)
             ctx.norm_scratch[key] = xn
         x_binding = (xn, 0)
-    stat_out = op.attrs.get("stat_value")
     rsplits = []
     for c in choices:                                               # a cached split that does not fit the shape (a stale cache) falls back to 1
         rs = int(str(c.macros.get("RSPLIT", "1")).rstrip("u")) if c else 1
         rsplits.append(rs if c is None or rs in kernels.gemv_rsplits(info.rows, int(c.macros["RG"]), epilogue) else 1)
-    if stat_out is not None:
+    stat_tg = (stat_out is not None and tile_range is None and len(variants) == 1 and choices[0] is not None
+               and choices[0].grid_mode == "tgsplit" and rsplits[0] > 1)
+    if stat_tg:
+        # the in-threadgroup row split (STAT_TG): the block's partial is chained over its rows in order after a barrier,
+        # so the statistic keeps the n_blocks partials of the unsplit op, value for value
+        ctx.stat_parts[stat_out] = n_blocks
+        _size_stat(ctx, stat_out)
+    elif stat_out is not None:
         # the statistic's partial count is one number for its consumer: every writer of the op — each shader variant and the
         # tile, which writes one partial per block — must agree on it, so with a tile every variant keeps RSPLIT = 1, and
         # without one the variants take the smallest split they all admit (a mismatch fed the next norm garbage partials
@@ -383,7 +394,11 @@ def _gemv(ctx: _Ctx, op: Op) -> None:
         rsplits = [1] * len(rsplits)                                # (no statistic: the split is free, but the tile's twin keeps the simple layout)
     lo = 0
     for tv, choice, rsplit in zip(variants, choices, rsplits):
-        rg = int(choice.macros["RG"]) if choice else None
+        # a shader variant beside the tile runs only for the few T below it (a prompt chunk of a row or two, a short
+        # verification): a tuned geometry was timed in a program where the op always runs, so the variant keeps the
+        # default RG and launch (the norm path stays the choices', and with it every output bit)
+        geo = choice if tile_range is None else None
+        rg = int(geo.macros["RG"]) if geo else None
         macros = dict(kernels.gemv_macros(info, t=tv, rg=rg, epilogue=epilogue, out_bf16=True, stat_out=stat_out is not None, rsplit=rsplit,
                                           norm=fuse_norm, round_before_residual=bool(op.attrs.get("round_residual"))), **ctx.t_macros(tv, t_src))
         macros.update(_norm_precision(stat))
@@ -391,7 +406,10 @@ def _gemv(ctx: _Ctx, op: Op) -> None:
             macros["SILU_ROUND"] = "1"
         if len(variants) > 1 or tile_range is not None:
             macros["T_LO"], macros["T_HI"] = str(lo), str(tv)
-        n_sg, grid, tg = ctx.geometry(choice.grid_mode if choice else "crew", n_blocks)
+        if stat_tg:
+            macros["STAT_TG"] = "1"
+        mode = geo.grid_mode if geo else "crew"
+        n_sg, grid, tg = ctx.geometry(mode, n_blocks, rsplit)
         prm = ctx.params("gemv", kernels.gemv_params(n_rows, n_blocks, n_sg, tv, eps=eps, block0=block0,
                                                      stat_parts=ctx.stat_parts.get(stat.name, 1) if stat is not None else 1))
         specialize = info.format in ("int4_affine", "nvfp4") or (
@@ -408,7 +426,7 @@ def _gemv(ctx: _Ctx, op: Op) -> None:
             bindings.append((8, stat_out, 0))
             writes.append(8)
         ctx.add(k, bindings, grid, tg, f"{op.kind}:{w.name}", writes=writes, kind=op.kind, bytes=nbytes, format=info.format, n=n_rows, k=info.k,
-                rg=int(macros["RG"]), rsplit=rsplit, geometry=choice.grid_mode if choice else "crew", fused_norm=fuse_norm, t_variant=tv,
+                rg=int(macros["RG"]), rsplit=rsplit, geometry=mode, fused_norm=fuse_norm, t_variant=tv,
                 t_range=[lo, tv] if (len(variants) > 1 or tile_range is not None) else None, variant_group=vgroup, sibling=bool(op.attrs.get("sibling")),
                 row_range=[block0 * info.rows, n_rows] if rr is not None else None)
         lo = tv
@@ -468,6 +486,7 @@ def _accel_plan(ctx: _Ctx, info: PackInfo, op: Op, t_c: int, t_src: int, variant
         # the T variants stay on it. A row range keeps the profile's rule (its tile share is the whole op's).
         norm_in = op.attrs.get("norm")
         parts_in = ctx.stat_parts.get(op.inputs[2].name, 1) if norm_in else 1
+        # both sides timed without the statistic: the tile's tuner does not write one
         shader = ctx.tuner.tune_gemv(info, t_c, op.attrs.get("epilogue"), bool(norm_in), stat_parts=parts_in)
         # the tile path of a norm-fed input is a permute dispatch (the norm applied on the way) plus the tile; an
         # un-normed input is written permuted by its producer (the attention merge, the silu·mul tile) — no permute

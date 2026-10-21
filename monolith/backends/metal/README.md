@@ -21,6 +21,8 @@ entries from that chip for its decode programs, plus the prompt pass's 32-row ti
 program. `serve` compiles with them (`Session(measured_choices=True)`); shapes they do not list keep the defaults, and
 `python -m monolith.generate --no-autotune` keeps the default geometry everywhere.
 Regenerate them when kernels change: `python -m monolith.generate` tunes and caches per pack.
+The 40-core M5 Max ships only T = 1 decode GEMV choices, limited to geometries that keep every output bit: no fused
+norm, and an op that writes a norm statistic splits its rows only inside one threadgroup (`tgsplit`).
 
 Unmeasured configurations have no cost tables or automatic megakernel fusion,
 and keep the tensor accelerator off. They provide a starting point for validation

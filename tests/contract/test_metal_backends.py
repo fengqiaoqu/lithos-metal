@@ -249,6 +249,21 @@ def test_invalid_template_path_is_rejected(name):
         kernels.template(name)
 
 
+def test_m5_max_choices_keep_every_output_bit():
+    # The M5 Max table only moves rows between SIMD-groups: a fused norm folds the statistic's partials in another order
+    # than norm_apply, and a row split on an op that writes a norm statistic changes that statistic's partial sums
+    # unless it stays inside one threadgroup (tgsplit: the block's partial is chained over its rows as before).
+    from monolith.backends.metal.config import kernel_choices, load_configs
+    choices = kernel_choices(load_configs()['apple-m5-max-40c'])
+    assert choices
+    for key, c in choices.items():
+        fields = key.split('|')
+        assert fields[0] == 'gemv' and fields[6] == 'T1', key
+        assert not c.get('fuse_norm'), key
+        if fields[7] == 'residual' and c['grid_mode'] != 'tgsplit':
+            assert int(c['macros'].get('RSPLIT', '1').rstrip('u')) == 1, key
+
+
 def test_kernel_choices_look_up_the_tuners_keys_without_timing():
     import numpy as np
     from monolith.bench import pack_spec, random_spec
@@ -264,10 +279,18 @@ def test_kernel_choices_look_up_the_tuners_keys_without_timing():
     assert choices.tune_gemm(info, 8, None).grid_mode == 'ksplit4'
     assert choices.tune_gemm(info, 8, None, permute=True) is None
     assert choices.tune_gdn(32, 16, 128, 128, 4, 1) is None
+    # a statistic producer takes its own entry where the table has one, else the shape's (the tables written before it)
+    res = {'macros': {'RG': '2'}, 'grid_mode': 'block', 'ms': 0.1, 'default_ms': 0.2}
+    stat = {'macros': {'RG': '4', 'RSPLIT': '2u'}, 'grid_mode': 'tgsplit', 'ms': 0.08, 'default_ms': 0.2}
+    older = KernelChoices({gemv_key(info, 1, 'residual', False): res})
+    assert older.tune_gemv(info, 1, 'residual', False, stat_out=True).grid_mode == 'block'
+    both = KernelChoices({gemv_key(info, 1, 'residual', False): res, gemv_key(info, 1, 'residual', False, stat_out=True): stat})
+    assert both.tune_gemv(info, 1, 'residual', False, stat_out=True).grid_mode == 'tgsplit'
+    assert both.tune_gemv(info, 1, 'residual', False).grid_mode == 'block'
 
 
 
-@pytest.mark.parametrize('name', ['apple-m3-ultra-60c', 'apple-m4-pro-20c'])
+@pytest.mark.parametrize('name', ['apple-m3-ultra-60c', 'apple-m4-pro-20c', 'apple-m5-max-40c'])
 def test_shipped_kernel_choices_are_valid_geometries(name, tmp_path):
     from monolith.backends.metal.config import kernel_choices, load_configs
     configs = load_configs()
@@ -279,12 +302,12 @@ def test_shipped_kernel_choices_are_valid_geometries(name, tmp_path):
         if kind == 'gemv':
             rows = int(next(f for f in fields if f.startswith('R'))[1:])
             rg, split = int(c['macros']['RG']), int(c['macros'].get('RSPLIT', '1').rstrip('u'))
-            assert c['grid_mode'] in ('crew', 'crew2', 'crew3', 'crew4', 'block'), key
+            assert c['grid_mode'] in ('crew', 'crew2', 'crew3', 'crew4', 'block', 'tgsplit'), key
             assert split in kernels.gemv_rsplits(rows, rg, 'silu_mul' if 'silu_mul' in fields else None), key
         elif kind == 'gemm3':
             assert c['grid_mode'] in ('crew', 'crew2') or kernels.gemm_ksplit(c['grid_mode']) > 1, key
         assert 0 < c['ms'] <= c['default_ms'], key
-    assert kernel_choices(configs['apple-m5-max-40c']) == {}
+    assert kernel_choices(configs['apple-m5-max-32c']) == {}
     # choices resolve beside the file a configuration was loaded from, under any name
     import shutil
     from monolith.backends.metal.config import load_config

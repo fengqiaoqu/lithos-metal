@@ -1,0 +1,127 @@
+{
+  "chip": "Apple M5 Max",
+  "cores": 40,
+  "measured": "2026-10-12",
+  "note": "T = 1 decode GEMV geometry for Qwen3.8-27B (nvidia NVFP4: its FP8 mixer and attention projections; mlx-community 4-bit: int4_affine), picked from compiler.autotune.Autotuner variants timed on this device and restricted to those that keep every output bit: no fused norm (its fold of the statistic's partials is not norm_apply's), and a row split on an op that writes a norm statistic only inside one threadgroup (tgsplit), whose partials are the unsplit op's. ms / default_ms: the shape's mean per-dispatch GPU time in the decode program with this table and with the default geometry (python -m monolith.trace counters)",
+  "choices": {
+    "gemv|fp8_e4m3|14336x5120|R16|interleaved16|inline|T1|plain|norm|P320": {
+      "macros": {
+        "RG": "2",
+        "RSPLIT": "8u"
+      },
+      "grid_mode": "crew",
+      "fuse_norm": false,
+      "ms": 0.0712,
+      "default_ms": 0.0843
+    },
+    "gemv|fp8_e4m3|14336x5120|R16|interleaved16|inline|T1|plain|norm|P640": {
+      "macros": {
+        "RG": "2",
+        "RSPLIT": "8u"
+      },
+      "grid_mode": "crew",
+      "fuse_norm": false,
+      "ms": 0.0712,
+      "default_ms": 0.0843
+    },
+    "gemv|fp8_e4m3|16384x5120|R16|interleaved16|inline|T1|plain|norm|P1": {
+      "macros": {
+        "RG": "1",
+        "RSPLIT": "16u"
+      },
+      "grid_mode": "crew4",
+      "fuse_norm": false,
+      "ms": 0.0549,
+      "default_ms": 0.0631
+    },
+    "gemv|fp8_e4m3|16384x5120|R16|interleaved16|inline|T1|plain|norm|P320": {
+      "macros": {
+        "RG": "1",
+        "RSPLIT": "16u"
+      },
+      "grid_mode": "crew4",
+      "fuse_norm": false,
+      "ms": 0.0549,
+      "default_ms": 0.0631
+    },
+    "gemv|fp8_e4m3|16384x5120|R16|interleaved16|inline|T1|plain|norm|P640": {
+      "macros": {
+        "RG": "1",
+        "RSPLIT": "16u"
+      },
+      "grid_mode": "crew4",
+      "fuse_norm": false,
+      "ms": 0.0549,
+      "default_ms": 0.0631
+    },
+    "gemv|fp8_e4m3|5120x6144|R16|interleaved16|inline|T1|residual|raw": {
+      "macros": {
+        "RG": "2",
+        "RSPLIT": "2u"
+      },
+      "grid_mode": "tgsplit",
+      "fuse_norm": false,
+      "ms": 0.0597,
+      "default_ms": 0.0663
+    },
+    "gemv|int4_affine|14336x5120|R16|interleaved16|inline|T1|plain|norm|P320": {
+      "macros": {
+        "RG": "1",
+        "RSPLIT": "16u"
+      },
+      "grid_mode": "crew2",
+      "fuse_norm": false,
+      "ms": 0.0447,
+      "default_ms": 0.0562
+    },
+    "gemv|int4_affine|16480x5120|R16|interleaved16|inline|T1|plain|norm|P1": {
+      "macros": {
+        "RG": "1",
+        "RSPLIT": "16u"
+      },
+      "grid_mode": "crew2",
+      "fuse_norm": false,
+      "ms": 0.0506,
+      "default_ms": 0.0586
+    },
+    "gemv|int4_affine|16480x5120|R16|interleaved16|inline|T1|plain|norm|P320": {
+      "macros": {
+        "RG": "1",
+        "RSPLIT": "16u"
+      },
+      "grid_mode": "crew2",
+      "fuse_norm": false,
+      "ms": 0.0506,
+      "default_ms": 0.0586
+    },
+    "gemv|int4_affine|248320x5120|R16|interleaved16|inline|T1|plain|norm|P320": {
+      "macros": {
+        "RG": "4"
+      },
+      "grid_mode": "block",
+      "fuse_norm": false,
+      "ms": 1.3117,
+      "default_ms": 1.519
+    },
+    "gemv|int4_affine|5120x17408|R16|interleaved16|inline|T1|residual|raw": {
+      "macros": {
+        "RG": "4",
+        "RSPLIT": "2u"
+      },
+      "grid_mode": "tgsplit",
+      "fuse_norm": false,
+      "ms": 0.0996,
+      "default_ms": 0.1608
+    },
+    "gemv|int4_affine|5120x6144|R16|interleaved16|inline|T1|residual|raw": {
+      "macros": {
+        "RG": "4",
+        "RSPLIT": "2u"
+      },
+      "grid_mode": "tgsplit",
+      "fuse_norm": false,
+      "ms": 0.0378,
+      "default_ms": 0.058
+    }
+  }
+}

@@ -116,6 +116,7 @@
       "dual_permute": true
     }
   },
+  "kernel_choices": "kernel-choices.json",
   "writer": {
     "tool": "tools/profile_writer.py",
     "written": "2026-10-01",
