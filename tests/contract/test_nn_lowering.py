@@ -398,6 +398,46 @@ def test_threadgroup_row_split_keeps_the_statistic(tmp_path):
     assert records(prog) and records(prog) == records(plain)
 
 
+def test_shader_variants_beside_a_tile_keep_the_default_geometry(tmp_path):
+    """A tuned geometry applies where the shader op always runs; the T variants below a tile (a prompt chunk of a row, a
+    short verification) keep the default RG and launch: a tuned per-block launch would be dispatched for nothing
+    whenever the tile takes the step, and the tuned RG was timed with its own launch."""
+    from monolith.compiler import compile_program
+    from monolith.compiler.autotune import Choice
+    from monolith.core.profile import Profile
+
+    class Stub:
+        def tune_gemv(self, info, t, epilogue, norm_fed, **kw):
+            return Choice({"RG": "1"}, "block")
+
+        def tune_gemm(self, *a, **kw):
+            return None
+
+        def tune_gdn(self, *a, **kw):
+            return None
+
+    _checkpoint(tmp_path)
+    m = Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=16)
+    pack_model(m, str(tmp_path), str(tmp_path / "pack"), PackLayout(rows=16))
+    prof = Profile.from_dict("p", {"gpu_cores": 20, "nominal_gbps": 307.0,
+                                   "engine": {"family": "Apple10", "lane_order": "interleaved16", "accelerator": "on"}})
+    tuned = compile_program(m, PackFile(tmp_path / "pack"), prof, t=8, dynamic_t=True, tuner=Stub())
+    plain = compile_program(m, PackFile(tmp_path / "pack"), prof, t=8, dynamic_t=True)
+    tiled = {o.meta.get("variant_group") for o in tuned.ops if tuned.kernels[o.kernel].function == "gemm_tile"} - {None}
+    beside = [o for o in tuned.ops if tuned.kernels[o.kernel].function == "gemv_T" and o.meta.get("variant_group") in tiled]
+    assert beside
+    def where(o):
+        return o.name, tuple(o.meta["t_range"]), tuple(o.meta.get("row_range") or ())     # a mixer's rows split into ranges
+    default = {where(o): o for o in plain.ops if o.meta.get("t_range")}
+    for o in beside:
+        p = default[where(o)]
+        assert o.meta["geometry"] == "crew" and tuned.kernels[o.kernel].macros == plain.kernels[p.kernel].macros, o.name
+        assert (o.grid, o.threadgroup) == (p.grid, p.threadgroup), o.name
+    static = compile_program(m, PackFile(tmp_path / "pack"), prof, t=1, tuner=Stub())
+    assert all(o.threadgroup == (64, 1, 1) and static.kernels[o.kernel].macros["RG"] == "1"
+               for o in static.ops if static.kernels[o.kernel].function == "gemv_T")
+
+
 def test_attention_norm_scale_flag():
     """A standard-RMSNorm attention (Qwen3) stores its q/k norm weights as they are; the Gemma-style one as 1 + w."""
     from monolith.nn import GQAAttention

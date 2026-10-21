@@ -394,7 +394,11 @@ def _gemv(ctx: _Ctx, op: Op) -> None:
         rsplits = [1] * len(rsplits)                                # (no statistic: the split is free, but the tile's twin keeps the simple layout)
     lo = 0
     for tv, choice, rsplit in zip(variants, choices, rsplits):
-        rg = int(choice.macros["RG"]) if choice else None
+        # a shader variant beside the tile runs only for the few T below it (a prompt chunk of a row or two, a short
+        # verification): a tuned geometry was timed in a program where the op always runs, so the variant keeps the
+        # default RG and launch (the norm path stays the choices', and with it every output bit)
+        geo = choice if tile_range is None else None
+        rg = int(geo.macros["RG"]) if geo else None
         macros = dict(kernels.gemv_macros(info, t=tv, rg=rg, epilogue=epilogue, out_bf16=True, stat_out=stat_out is not None, rsplit=rsplit,
                                           norm=fuse_norm, round_before_residual=bool(op.attrs.get("round_residual"))), **ctx.t_macros(tv, t_src))
         macros.update(_norm_precision(stat))
@@ -404,7 +408,8 @@ def _gemv(ctx: _Ctx, op: Op) -> None:
             macros["T_LO"], macros["T_HI"] = str(lo), str(tv)
         if stat_tg:
             macros["STAT_TG"] = "1"
-        n_sg, grid, tg = ctx.geometry(choice.grid_mode if choice else "crew", n_blocks, rsplit)
+        mode = geo.grid_mode if geo else "crew"
+        n_sg, grid, tg = ctx.geometry(mode, n_blocks, rsplit)
         prm = ctx.params("gemv", kernels.gemv_params(n_rows, n_blocks, n_sg, tv, eps=eps, block0=block0,
                                                      stat_parts=ctx.stat_parts.get(stat.name, 1) if stat is not None else 1))
         specialize = info.format in ("int4_affine", "nvfp4") or (
@@ -421,7 +426,7 @@ def _gemv(ctx: _Ctx, op: Op) -> None:
             bindings.append((8, stat_out, 0))
             writes.append(8)
         ctx.add(k, bindings, grid, tg, f"{op.kind}:{w.name}", writes=writes, kind=op.kind, bytes=nbytes, format=info.format, n=n_rows, k=info.k,
-                rg=int(macros["RG"]), rsplit=rsplit, geometry=choice.grid_mode if choice else "crew", fused_norm=fuse_norm, t_variant=tv,
+                rg=int(macros["RG"]), rsplit=rsplit, geometry=mode, fused_norm=fuse_norm, t_variant=tv,
                 t_range=[lo, tv] if (len(variants) > 1 or tile_range is not None) else None, variant_group=vgroup, sibling=bool(op.attrs.get("sibling")),
                 row_range=[block0 * info.rows, n_rows] if rr is not None else None)
         lo = tv
