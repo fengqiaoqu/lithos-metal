@@ -38,7 +38,8 @@ class Gemv:
         self.wbuf, self.rsbuf = nt.Buffer(dev, self.data), nt.Buffer(dev, self.row_scales.tobytes())
         self.n_sg = 12 * dev.info().gpu_cores
 
-    def run(self, x_bf16, *, norm=None, epilogue=None, residual=None, stat_out=False, t_active=None, out_bf16=None, rsplit=1, rg=None, extra_macros=None):
+    def run(self, x_bf16, *, norm=None, epilogue=None, residual=None, stat_out=False, t_active=None, out_bf16=None, rsplit=1, rg=None, extra_macros=None,
+            tg_split=False):
         """``x_bf16`` uint16 [T, K]; ``norm`` = (stat float32 array, parts, norm_w float32 [K]); returns
         ``(y, stat_out)`` with y float32 [T, N] (or [T, N/2] for silu_mul); ``rsplit`` work items per block (the
         statistic then has n_blocks · rsplit partials per token)."""
@@ -47,27 +48,32 @@ class Gemv:
             out_bf16 = epilogue is not None
         macros = kernels.gemv_macros(self.info, t=t, norm=norm is not None, epilogue=epilogue, stat_out=stat_out, out_bf16=out_bf16, rsplit=rsplit, rg=rg)
         macros.update(extra_macros or {})
+        if tg_split:                                                       # a block per threadgroup of rsplit SIMD-groups
+            macros["STAT_TG"] = "1"
         pso = nt.Pipeline(nt.Library(self.dev, kernels.gemv_source(self.fmt), macros), "gemv_T")
+        n_sg, grid, tg = ((self.info.n_blocks * rsplit, self.info.n_blocks, 32 * rsplit) if tg_split
+                          else (self.n_sg, -(-(self.n_sg * 32) // 384), 384))
+        parts_out = self.info.n_blocks * (1 if tg_split else rsplit)
         n_out = n // 2 if epilogue == "silu_mul" else n
         y = nt.Buffer(self.dev, t * n_out * 4); y.fill(0)
         parts = norm[1] if norm else 1
         t_act = t if t_active is None else t_active
         d = (nt.Dispatch().pipeline(pso).buffer(0, self.wbuf).buffer(1, self.rsbuf).buffer(2, nt.Buffer(self.dev, x_bf16.tobytes()))
-             .buffer(3, y).bytes(4, kernels.gemv_params(n, self.info.n_blocks, self.n_sg, t_act, eps=EPS, stat_parts=parts))
-             .grid(-(-(self.n_sg * 32) // 384)).threadgroup(384))
+             .buffer(3, y).bytes(4, kernels.gemv_params(n, self.info.n_blocks, n_sg, t_act, eps=EPS, stat_parts=parts))
+             .grid(grid).threadgroup(tg))
         if norm:
             d.buffer(5, nt.Buffer(self.dev, np.asarray(norm[0], np.float32).tobytes())).buffer(6, nt.Buffer(self.dev, np.asarray(norm[2], np.float32).tobytes()))
         if epilogue == "residual":
             d.buffer(7, nt.Buffer(self.dev, residual.tobytes()))
         so = None
         if stat_out:
-            so = nt.Buffer(self.dev, t * self.info.n_blocks * rsplit * 4); so.fill(0)
+            so = nt.Buffer(self.dev, t * parts_out * 4); so.fill(0)
             d.buffer(8, so)
         r = nt.Queue(self.dev).run([d])
         assert not r.error, r.error
         raw = y.read(0, t * n_out * (2 if out_bf16 else 4))
         out = bf16_to_f32(np.frombuffer(raw, dtype=np.uint16)).reshape(t, n_out) if out_bf16 else np.frombuffer(raw, dtype=np.float32).reshape(t, n_out)
-        so_arr = np.frombuffer(so.read(0, t * self.info.n_blocks * rsplit * 4), dtype=np.float32).reshape(t, self.info.n_blocks * rsplit) if stat_out else None
+        so_arr = np.frombuffer(so.read(0, t * parts_out * 4), dtype=np.float32).reshape(t, parts_out) if stat_out else None
         return out, so_arr
 
 
@@ -96,6 +102,24 @@ def test_row_split_items_reproduce_the_whole(dev, fmt, epilogue, rsplit):
     assert kernels.gemv_rsplits(16, 1, None) == [1, 2, 4, 8, 16] and kernels.gemv_rsplits(16, 1, "silu_mul") == [1, 2, 4, 8]
     with pytest.raises(ValueError):
         kernels.gemv_macros(g.info, t=t, rg=8, rsplit=4)
+
+
+@pytest.mark.parametrize("fmt", ["nvfp4", "fp8_e4m3", "int4_affine"])
+@pytest.mark.parametrize("t,rsplit,rg", [(1, 2, 4), (1, 4, 2), (1, 8, 2), (1, 16, 1), (2, 2, 2)])
+def test_threadgroup_row_split_keeps_the_statistic(dev, fmt, t, rsplit, rg):
+    """STAT_TG: a statistic producer's RSPLIT items are one threadgroup's SIMD-groups, and the block's partial is
+    chained over its rows after a barrier — outputs and partials byte-identical to the unsplit kernel's, so the next
+    norm reads the same statistic (a plain row split writes a partial per item, other sums)."""
+    rows = 16
+    n = 40 * rows
+    g = Gemv(dev, fmt, n, rows, t)
+    rng = np.random.default_rng(23)
+    x = f32_to_bf16(rng.uniform(-1, 1, size=(t, K)).astype(np.float32))
+    res = f32_to_bf16(rng.uniform(-1, 1, size=(t, n)).astype(np.float32))
+    whole, so_w = g.run(x, epilogue="residual", residual=res, stat_out=True, out_bf16=True, rg=2)
+    split, so_s = g.run(x, epilogue="residual", residual=res, stat_out=True, out_bf16=True, rsplit=rsplit, rg=rg, tg_split=True)
+    assert np.array_equal(whole, split)
+    assert so_s.shape == so_w.shape and so_s.tobytes() == so_w.tobytes()
 
 
 def _norm_inputs(rng, t, scale=1.0):
@@ -219,6 +243,23 @@ def test_autotuner_picks_and_caches(dev, tmp_path):
     again = Autotuner(dev, dev.info().gpu_cores, str(cache))
     assert again.tune_gemv(info, 1, "residual", False).macros == c.macros and len(again.choices) == 4
     assert again.tune_gemm(info, 8, "residual").grid_mode == m.grid_mode
+
+
+def test_autotuner_times_a_statistic_producer_with_its_statistic(dev, tmp_path):
+    """An op that writes the next norm's statistic is timed with it in every variant, the default included, in its own
+    cache entry, and only it is offered the in-threadgroup row split (tgsplit: STAT_TG needs the statistic)."""
+    from monolith.compiler.autotune import Autotuner, gemv_key
+
+    tuner = Autotuner(dev, dev.info().gpu_cores, str(tmp_path / "autotune.json"), reps=2, warmup_ms=5.0)
+    rng = np.random.default_rng(1)
+    _, info, _ = pack_spec(random_spec("fp8_e4m3", 512, K, rng), PackLayout(rows=16))
+    plain = tuner.tune_gemv(info, 1, "residual", False)
+    variants = tuner.choices[gemv_key(info, 1, "residual", False)]["variants"]
+    assert plain.grid_mode != "tgsplit" and all(v["mode"] != "tgsplit" for _, v in variants)
+    c = tuner.tune_gemv(info, 1, "residual", False, stat_out=True)            # not the plain entry: timed again, with the statistic
+    modes = {v["mode"] for _, v in tuner.choices[gemv_key(info, 1, "residual", False, stat_out=True)]["variants"]}
+    assert "tgsplit" in modes and {"crew", "block"} <= modes
+    assert c.ms > 0 and c.ms <= c.default_ms * 1.001
 
 
 def test_row_range_equals_the_slice_of_the_whole(dev):

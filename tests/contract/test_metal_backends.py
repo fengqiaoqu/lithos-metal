@@ -264,6 +264,14 @@ def test_kernel_choices_look_up_the_tuners_keys_without_timing():
     assert choices.tune_gemm(info, 8, None).grid_mode == 'ksplit4'
     assert choices.tune_gemm(info, 8, None, permute=True) is None
     assert choices.tune_gdn(32, 16, 128, 128, 4, 1) is None
+    # a statistic producer takes its own entry where the table has one, else the shape's (the tables written before it)
+    res = {'macros': {'RG': '2'}, 'grid_mode': 'block', 'ms': 0.1, 'default_ms': 0.2}
+    stat = {'macros': {'RG': '4', 'RSPLIT': '2u'}, 'grid_mode': 'tgsplit', 'ms': 0.08, 'default_ms': 0.2}
+    older = KernelChoices({gemv_key(info, 1, 'residual', False): res})
+    assert older.tune_gemv(info, 1, 'residual', False, stat_out=True).grid_mode == 'block'
+    both = KernelChoices({gemv_key(info, 1, 'residual', False): res, gemv_key(info, 1, 'residual', False, stat_out=True): stat})
+    assert both.tune_gemv(info, 1, 'residual', False, stat_out=True).grid_mode == 'tgsplit'
+    assert both.tune_gemv(info, 1, 'residual', False).grid_mode == 'block'
 
 
 

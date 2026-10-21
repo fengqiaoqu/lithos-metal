@@ -360,6 +360,44 @@ def test_emitter_honors_the_tuner(tmp_path):
     assert any(c[0] == "gdn" for c in stub.calls) and sum(c[0] == "gemv" for c in stub.calls) == len(gemvs)
 
 
+def test_threadgroup_row_split_keeps_the_statistic(tmp_path):
+    """A statistic producer split inside one threadgroup (tgsplit, STAT_TG) writes the unsplit op's partials: the
+    consumers' records are the default program's byte for byte; a split elsewhere keeps the plain row split."""
+    from monolith.compiler import compile_program
+    from monolith.compiler.autotune import Choice
+    from monolith.core.profile import Profile
+
+    class Stub:
+        def __init__(self):
+            self.stat_out = []
+
+        def tune_gemv(self, info, t, epilogue, norm_fed, **kw):
+            self.stat_out.append(kw.get("stat_out"))
+            return Choice({"RG": "1", "RSPLIT": "2u"}, "tgsplit")
+
+        def tune_gdn(self, *a, **kw):
+            return None
+
+    _checkpoint(tmp_path)
+    m = Qwen3_5Model.from_checkpoint(str(tmp_path), max_context=16)
+    pack_model(m, str(tmp_path), str(tmp_path / "pack"), PackLayout(rows=16))
+    prof = Profile.from_dict("p", {"gpu_cores": 20, "nominal_gbps": 307.0, "engine": {"family": "Apple10", "lane_order": "interleaved16"}})
+    stub = Stub()
+    prog = compile_program(m, PackFile(tmp_path / "pack"), prof, t=1, tuner=stub)
+    plain = compile_program(m, PackFile(tmp_path / "pack"), prof, t=1)
+    gemvs = [o for o in prog.ops if o.name.startswith("gemv:") or o.name.startswith("lm_head:")]
+    producers = [o for o in gemvs if any(b[0] == 8 for b in o.bindings)]
+    assert producers and all(prog.kernels[o.kernel].macros.get("STAT_TG") == "1" for o in producers)
+    # the tuner is told which ops write a statistic: it times those with it
+    assert stub.stat_out.count(True) == len(producers) and stub.stat_out.count(False) == len(gemvs) - len(producers)
+    assert all(o.threadgroup == (64, 1, 1) and o.grid == (-(-o.meta["n"] // 16), 1, 1) for o in producers)   # a block per threadgroup
+    assert not any(prog.kernels[o.kernel].macros.get("STAT_TG") for o in gemvs if o not in producers)
+
+    def records(p):
+        return [p.buffers[b[1]].init for o in p.ops if o.name.startswith("norm_apply") for b in o.bindings if b[0] == 4]
+    assert records(prog) and records(prog) == records(plain)
+
+
 def test_attention_norm_scale_flag():
     """A standard-RMSNorm attention (Qwen3) stores its q/k norm weights as they are; the Gemma-style one as 1 + w."""
     from monolith.nn import GQAAttention

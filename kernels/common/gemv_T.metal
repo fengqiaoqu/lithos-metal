@@ -128,6 +128,13 @@ struct GemvParams { uint n_rows; uint n_blocks; uint n_sg; uint t_active; float 
 #endif                                                 // (silu_mul: that share of the gate rows and their up partners) — a narrow slab's blocks alone
                                                        // leave most of the crew idle (design §5.5: 64 blocks over 240 SIMD-groups); RG divides the share
 #define RR (R / RSPLIT)                                // rows per item
+#ifndef STAT_TG
+#define STAT_TG 0                    // 1 (with STAT_OUT and RSPLIT > 1): a block's RSPLIT items are the SIMD-groups of one threadgroup
+#endif                               // (one item each); after a barrier the block's partial is chained over its rows in order, the
+                                     // partial of RSPLIT = 1, so the statistic keeps its n_blocks partials and their values
+#if STAT_TG && (!STAT_OUT || RSPLIT == 1 || PAIRS || EPILOGUE == 2)
+#error "gemv_T STAT_TG: the row split of a statistic producer (STAT_OUT, RSPLIT > 1, no PAIRS, no silu_mul)"
+#endif
 #if (R % RSPLIT) != 0 || (RR % RG) != 0
 #error "gemv_T: RSPLIT must divide R and RG must divide R / RSPLIT"
 #endif
@@ -318,6 +325,9 @@ kernel void gemv_T(device const uint4* w [[buffer(0)]], device const float* row_
 #endif
   }
 #endif
+#if STAT_TG
+  threadgroup float block_vr[R][T];                            // the block's BF16-rounded outputs, for its statistic partial
+#endif
 #if PAIRS == 2
   // One expert's selected tokens share its decoded weights. The table builder
   // partitions large groups into at most T pairs; stores retain original slots.
@@ -360,6 +370,9 @@ kernel void gemv_T(device const uint4* w [[buffer(0)]], device const float* row_
 #if STAT_OUT
     float ssq_out[T];
     for (uint t = 0; t < T; t++) ssq_out[t] = 0.0f;
+#endif
+#if STAT_TG
+    if (lane == 0) for (uint r = part * RR; r < (part + 1u) * RR; r++) for (uint t = 0; t < T; t++) block_vr[r][t] = 0.0f;   // fma(0, 0, s) = s
 #endif
 #if EPILOGUE == 2
 #define CR (CHUNK / RSPLIT)
@@ -534,7 +547,11 @@ kernel void gemv_T(device const uint4* w [[buffer(0)]], device const float* row_
           if (orow < n_out && t < T_act) {
             const float vr = round_bf16(v);
 #if STAT_OUT
+#if STAT_TG
+            if (lane == 0) block_vr[r][t] = vr;
+#else
             ssq_out[t] = fma(vr, vr, ssq_out[t]);
+#endif
 #endif
             if (lane == 0) {
 #if PAIRS == 2
@@ -555,7 +572,16 @@ kernel void gemv_T(device const uint4* w [[buffer(0)]], device const float* row_
       }
     }
 #if STAT_OUT
+#if STAT_TG
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (part == 0u && lane == 0) for (uint t = 0; t < T; t++) if (t < T_act) {
+      float s = 0.0f;
+      for (uint r = 0; r < R; r++) s = fma(block_vr[r][t], block_vr[r][t], s);
+      stat_out[t * p.n_blocks + bb] = s;
+    }
+#else
     if (lane == 0) for (uint t = 0; t < T; t++) if (t < T_act) stat_out[t * p.n_blocks * RSPLIT + it] = ssq_out[t];   // one partial per item
+#endif
 #endif
   }
 }
